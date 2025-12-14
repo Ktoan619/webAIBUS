@@ -69,7 +69,8 @@ def transcribe_audio_with_gemini(audio_file, api_key):
     if not api_key: return None
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash") # Model Flash xử lý audio nhanh
+        # SỬA LỖI: Chuyển sang model 2.0-flash-exp để đồng bộ và ổn định hơn
+        model = genai.GenerativeModel("gemini-2.0-flash-exp")
         
         # Đọc dữ liệu audio
         audio_bytes = audio_file.read()
