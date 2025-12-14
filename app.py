@@ -11,7 +11,7 @@ from streamlit_js_eval import get_geolocation
 # Import dữ liệu từ file data
 from data_and_prompts import BUS_DATA, get_full_system_instruction
 
-# --- 1. CẤU HÌNH TRANG & CSS (MÀU XANH LÁ + CHỮ ĐEN) ---
+# --- 1. CẤU HÌNH TRANG & CSS ---
 st.set_page_config(
     page_title="VnBus Green AI Pro",
     page_icon="🍃",
@@ -40,20 +40,23 @@ st.markdown("""
     [data-testid="stSidebar"] { background-color: #ffffff; border-right: 1px solid #10b981; }
     audio { width: 100%; height: 30px; margin-top: 5px; }
     
-    /* Highlight box cho chỉ dẫn đường */
     .direction-box {
         background-color: #d1fae5; border-left: 5px solid #059669;
         padding: 15px; border-radius: 5px; margin-top: 10px;
     }
+    .price-tag {
+        background-color: #f59e0b; color: white !important; 
+        padding: 2px 6px; border-radius: 4px; font-size: 0.9em; font-weight: bold;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. CÁC HÀM XỬ LÝ API & LOGIC ---
+# --- 2. CÁC HÀM XỬ LÝ ---
 
 def text_to_speech_stream(text):
-    """Chuyển văn bản thành giọng nói (Memory Stream)"""
+    """Chuyển văn bản thành giọng nói (gTTS)"""
     try:
-        clean_text = re.sub(r'[*_#<>]', '', text) # Làm sạch markdown & html
+        clean_text = re.sub(r'[*_#<>]', '', text)
         tts = gTTS(text=clean_text, lang='vi')
         audio_fp = io.BytesIO()
         tts.write_to_fp(audio_fp)
@@ -61,49 +64,81 @@ def text_to_speech_stream(text):
         return audio_fp
     except: return None
 
-def get_google_directions_text(origin, destination, api_key):
-    """Gọi Google API lấy chỉ dẫn chi tiết dạng văn bản (Backend)"""
-    if not api_key: return None, None
+def transcribe_audio_with_gemini(audio_file, api_key):
+    """Dùng Gemini để chuyển giọng nói thành văn bản"""
+    if not api_key: return None
     try:
-        # 1. Tìm đường đi bộ/xe buýt
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-1.5-flash") # Model Flash xử lý audio nhanh
+        
+        # Đọc dữ liệu audio
+        audio_bytes = audio_file.read()
+        
+        prompt = "Hãy chép lại chính xác những gì người dùng nói trong đoạn ghi âm này bằng tiếng Việt. Chỉ trả về nội dung văn bản, không thêm lời dẫn."
+        
+        response = model.generate_content([
+            prompt,
+            {"mime_type": "audio/wav", "data": audio_bytes}
+        ])
+        return response.text.strip()
+    except Exception as e:
+        st.error(f"Lỗi nhận diện giọng nói: {e}")
+        return None
+
+def get_google_directions_text(origin, destination, api_key):
+    """Gọi Google Directions API"""
+    if not api_key: return None, None, None
+    try:
         url = "https://maps.googleapis.com/maps/api/directions/json"
         params = {
-            "origin": origin,
-            "destination": destination,
-            "mode": "transit",
-            "transit_mode": "bus",
-            "language": "vi",
-            "key": api_key
+            "origin": origin, "destination": destination,
+            "mode": "transit", "transit_mode": "bus",
+            "language": "vi", "key": api_key
         }
         resp = requests.get(url, params=params).json()
+        if resp["status"] != "OK": return None, f"Lỗi Google Maps: {resp['status']}", None
         
-        if resp["status"] != "OK": return None, f"Lỗi Google Maps: {resp['status']}"
-        
-        # 2. Phân tích steps để lấy hướng dẫn
         leg = resp["routes"][0]["legs"][0]
         duration = leg["duration"]["text"]
         distance = leg["distance"]["text"]
         
         steps_info = []
-        summary = f"🚌 Lộ trình: {distance} ({duration}).\n"
+        voice_sentences = [f"Tìm thấy lộ trình dài {distance}, mất khoảng {duration}."]
+        summary = f"🚌 <b>Lộ trình:</b> {distance} (khoảng {duration})."
         
         for step in leg["steps"]:
-            instruction = re.sub('<[^<]+?>', '', step["html_instructions"]) # Bỏ HTML tag
+            instruction = re.sub('<[^<]+?>', '', step["html_instructions"])
             if step["travel_mode"] == "TRANSIT":
-                bus_line = step["transit_details"]["line"]["short_name"]
-                headsign = step["transit_details"]["headsign"]
-                steps_info.append(f"🚍 Bắt xe {bus_line} (hướng {headsign}): {instruction}")
+                td = step["transit_details"]
+                bus_line = td["line"].get("short_name", "Bus")
+                headsign = td["headsign"]
+                dep_time = td.get("departure_time", {}).get("text", "sắp đến")
+                
+                # Tra cứu giá vé
+                found_bus = next((b for b in BUS_DATA if b['id'] == bus_line), None)
+                bus_price = f"<span class='price-tag'>{found_bus['price']}</span>" if found_bus else ""
+                price_voice = f"Giá vé {found_bus['price'].replace('.', '').replace('đ', ' đồng')}." if found_bus else ""
+                
+                steps_info.append(f"""
+                <div style="margin-bottom:8px;">
+                    🚍 <b>Bắt xe {bus_line}</b> {bus_price}<br>
+                    <small>Hướng: {headsign} • Xe đến: <b>{dep_time}</b></small><br>
+                    <i style="color:#444;">{instruction}</i>
+                </div>
+                """)
+                voice_sentences.append(f"Đón xe số {bus_line} hướng về {headsign}. {price_voice} Xe đến lúc {dep_time}.")
             elif step["travel_mode"] == "WALKING":
                 steps_info.append(f"🚶 {instruction}")
+                voice_sentences.append(f"Đi bộ: {instruction}.")
         
-        full_text = summary + "\n".join(steps_info)
-        return full_text, None
+        full_html = summary + "<br><hr>" + "".join(steps_info)
+        return full_html, None, " ".join(voice_sentences)
     except Exception as e:
-        return None, str(e)
+        return None, str(e), None
 
-# --- 3. QUẢN LÝ TRẠNG THÁI (STATE) ---
+# --- 3. QUẢN LÝ TRẠNG THÁI ---
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Xin chào! Bạn muốn đi đâu? (Có thể nói 'Từ vị trí của tôi' để dùng GPS)"}]
+    st.session_state.messages = [{"role": "assistant", "content": "Xin chào! Bạn muốn đi đâu? (Nhấn nút 🎙️ để nói)"}]
 if "selected_route" not in st.session_state: st.session_state.selected_route = None
 if "custom_route" not in st.session_state: st.session_state.custom_route = None
 if "user_location" not in st.session_state: st.session_state.user_location = None
@@ -112,20 +147,14 @@ if "user_location" not in st.session_state: st.session_state.user_location = Non
 with st.sidebar:
     st.title("🌿 VnBus Pro")
     st.markdown("---")
-    
-    # API Keys
     maps_key = st.secrets.get("GOOGLE_MAPS_KEY", "") or st.text_input("🔑 Google Maps Key", type="password")
     gemini_key = st.secrets.get("GEMINI_KEY", "") or st.text_input("✨ Gemini API Key", type="password")
     
     st.markdown("---")
-    st.subheader("📡 Định vị GPS")
-    
-    # Nút lấy vị trí (Sử dụng streamlit_js_eval)
     if st.checkbox("Sử dụng Vị trí hiện tại"):
         loc = get_geolocation()
         if loc:
-            lat = loc['coords']['latitude']
-            lng = loc['coords']['longitude']
+            lat, lng = loc['coords']['latitude'], loc['coords']['longitude']
             st.session_state.user_location = f"{lat},{lng}"
             st.success(f"📍 Đã định vị: {lat:.4f}, {lng:.4f}")
         else:
@@ -135,7 +164,7 @@ with st.sidebar:
     enable_tts = st.checkbox("🔊 Đọc to câu trả lời", value=True)
     mode = st.radio("Chế độ:", ["Chat & Chỉ đường 🤖", "Tra cứu Tuyến 🚌"])
 
-# --- 5. HÀM RENDER MAP (IFRAME) ---
+# --- 5. RENDER MAP ---
 def render_map_html(origin, destination, api_key):
     if api_key:
         src = f"https://www.google.com/maps/embed/v1/directions?key={api_key}&origin={origin}&destination={destination}&mode=transit"
@@ -148,89 +177,94 @@ col1, col2 = st.columns([1, 1.2])
 with col1:
     if mode == "Chat & Chỉ đường 🤖":
         st.subheader("💬 Trợ lý Thông minh")
-        chat_container = st.container(height=450)
+        chat_container = st.container(height=400)
         
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"], unsafe_allow_html=True)
                 if msg.get("audio"): st.audio(msg["audio"], format="audio/mp3")
 
-        prompt = st.chat_input("Nhập nơi muốn đến (VD: Đi đến Chợ Bến Thành)...")
+        # --- KHU VỰC NHẬP LIỆU (TEXT + VOICE) ---
+        # 1. Nhập văn bản
+        text_prompt = st.chat_input("Nhập nơi muốn đến...")
         
-        if prompt:
-            st.session_state.messages.append({"role": "user", "content": prompt})
+        # 2. Nhập giọng nói (Widget mới)
+        audio_prompt = st.audio_input("🎙️ Nhấn để nói", label_visibility="collapsed")
+        
+        final_prompt = None
+        
+        # Ưu tiên xử lý Audio nếu có
+        if audio_prompt:
+            if not gemini_key:
+                st.error("Vui lòng nhập Gemini Key để dùng tính năng giọng nói.")
+            else:
+                with st.spinner("Đang nghe và dịch..."):
+                    transcribed_text = transcribe_audio_with_gemini(audio_prompt, gemini_key)
+                    if transcribed_text:
+                        final_prompt = transcribed_text
+        # Nếu không có audio mới dùng text
+        elif text_prompt:
+            final_prompt = text_prompt
+
+        # --- XỬ LÝ PROMPT ---
+        if final_prompt:
+            st.session_state.messages.append({"role": "user", "content": final_prompt})
             with chat_container:
-                with st.chat_message("user"): st.write(prompt)
+                with st.chat_message("user"): st.write(final_prompt)
 
             response_text = ""
-            origin_coords = None
-            dest_point = None
+            voice_text_response = ""
             
-            # Logic AI phân tích
             if gemini_key:
                 try:
                     genai.configure(api_key=gemini_key)
-                    # Prompt nâng cấp: Nhận diện "Vị trí của tôi"
                     sys_prompt = get_full_system_instruction() + "\n\nQUAN TRỌNG: Nếu người dùng nói 'từ đây', 'vị trí của tôi', hãy trả về MAP_CMD với điểm đi là 'CURRENT_LOC'."
-                    
                     model = genai.GenerativeModel('gemini-2.0-flash-exp', system_instruction=sys_prompt)
                     
-                    # History
-                    gemini_history = []
-                    for msg in st.session_state.messages[-6:]: # Lấy 6 tin gần nhất
-                        if msg["role"] in ["user", "model"]: # Lọc role hợp lệ
-                            gemini_history.append({"role": "user" if msg["role"]=="user" else "model", "parts": [str(msg["content"])]})
-
+                    gemini_history = [{"role": "user" if m["role"]=="user" else "model", "parts": [str(m["content"])]} for m in st.session_state.messages[-6:]]
+                    
                     chat = model.start_chat(history=gemini_history)
-                    response = chat.send_message(prompt)
+                    response = chat.send_message(final_prompt)
                     raw_text = response.text
                     
-                    # Xử lý MAP_CMD từ AI
                     map_cmd_match = re.search(r"MAP_CMD:\s*(.*?)\s*\|\s*(.*)", raw_text)
                     
                     if map_cmd_match:
-                        origin_raw = map_cmd_match.group(1).strip()
-                        dest_raw = map_cmd_match.group(2).strip()
-                        
-                        # Xử lý GPS
+                        origin_raw, dest_raw = map_cmd_match.group(1).strip(), map_cmd_match.group(2).strip()
                         final_origin = st.session_state.user_location if (origin_raw == "CURRENT_LOC" and st.session_state.user_location) else origin_raw
                         if origin_raw == "CURRENT_LOC" and not st.session_state.user_location:
-                            final_origin = "Ho Chi Minh City" # Fallback
-                            response_text = "⚠️ Chưa lấy được GPS, tôi sẽ tính từ trung tâm TP.HCM.\n"
+                            final_origin, response_text = "Ho Chi Minh City", "⚠️ Chưa lấy được GPS, tính từ trung tâm.\n"
 
                         st.session_state.custom_route = {"origin": final_origin, "destination": dest_raw}
                         
-                        # GỌI GOOGLE DIRECTIONS API (Backend) để lấy text chi tiết
-                        directions_text, err = get_google_directions_text(final_origin, dest_raw, maps_key)
-                        
+                        directions_html, err, voice_optimized = get_google_directions_text(final_origin, dest_raw, maps_key)
                         clean_ai_text = raw_text.replace(map_cmd_match.group(0), "").strip()
                         
-                        if directions_text:
-                            response_text += f"{clean_ai_text}\n\n<div class='direction-box'><b>🗺️ Chi tiết lộ trình:</b><br>{directions_text.replace(chr(10), '<br>')}</div>"
+                        if directions_html:
+                            response_text += f"{clean_ai_text}\n\n<div class='direction-box'>{directions_html}</div>"
+                            voice_text_response = f"{clean_ai_text}. {voice_optimized}"
                         else:
                             response_text += clean_ai_text
+                            voice_text_response = clean_ai_text
                     else:
-                        response_text = raw_text
+                        response_text, voice_text_response = raw_text, raw_text
 
                 except Exception as e:
                     response_text = f"⚠️ Lỗi AI: {e}"
             else:
-                response_text = "Vui lòng nhập API Key để tôi có thể chỉ đường thông minh."
+                response_text = "Vui lòng nhập API Key."
 
-            # TTS Output
             msg_data = {"role": "assistant", "content": response_text}
             if enable_tts:
-                # Chỉ đọc phần text, bỏ qua phần HTML hướng dẫn dài dòng để tránh đọc lâu
-                text_to_read = re.sub(r"<div.*</div>", "Tôi đã tìm thấy lộ trình chi tiết bên dưới.", response_text, flags=re.DOTALL)
-                audio_bytes = text_to_speech_stream(text_to_read)
+                audio_bytes = text_to_speech_stream(voice_text_response or re.sub(r"<[^>]+>", "", response_text))
                 if audio_bytes: msg_data["audio"] = audio_bytes
 
             st.session_state.messages.append(msg_data)
             st.rerun()
 
-    else: # Chế độ Tra cứu Tuyến (Giữ nguyên logic cũ)
+    else: # Chế độ Tra cứu
         st.subheader("🔍 Tra cứu Tuyến Xe")
-        search_q = st.text_input("Nhập số xe (VD: 152, 01)...")
+        search_q = st.text_input("Nhập số xe (VD: 152)...")
         if search_q:
             found = next((b for b in BUS_DATA if b['id'] == search_q or b['id'] == search_q.upper()), None)
             if found:
@@ -239,33 +273,19 @@ with col1:
                 st.write(f"**Lộ trình:** {', '.join(found['stops'])}")
                 st.session_state.selected_route = found
                 st.session_state.custom_route = None
-            else:
-                st.error("Không tìm thấy tuyến này.")
+            else: st.error("Không tìm thấy tuyến này.")
 
-# --- 7. CỘT PHẢI: BẢN ĐỒ & TRẠNG THÁI ---
+# --- 7. CỘT PHẢI ---
 with col2:
     st.subheader("🗺️ Bản đồ & Lộ trình")
-    
-    # Ưu tiên hiển thị Route tùy chỉnh (A->B)
     if st.session_state.custom_route:
         r = st.session_state.custom_route
         st.markdown(f"**Từ:** `{r['origin']}` ➝ **Đến:** `{r['destination']}`")
-        map_html = render_map_html(r['origin'], r['destination'], maps_key)
-        components.html(map_html, height=450)
-        
-    # Hoặc hiển thị Route xe buýt cụ thể
+        components.html(render_map_html(r['origin'], r['destination'], maps_key), height=450)
     elif st.session_state.selected_route:
         bus = st.session_state.selected_route
         st.markdown(f"**Tuyến:** `{bus['name']}`")
-        # Với tuyến xe, ta vẽ từ điểm đầu đến điểm cuối
-        map_html = render_map_html(bus['stops'][0], bus['stops'][-1], maps_key)
-        components.html(map_html, height=450)
-    
+        components.html(render_map_html(bus['stops'][0], bus['stops'][-1], maps_key), height=450)
     else:
         st.info("👋 Hãy chat để tìm đường hoặc tra cứu tuyến xe.")
-        st.markdown("""
-        <div style="text-align:center; padding: 40px; color: #10b981; border: 2px dashed #10b981; border-radius: 10px;">
-            <h1 style="font-size: 60px;">🚌</h1>
-            <h3>VnBus Green AI</h3>
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown("""<div style="text-align:center; padding: 40px; color: #10b981; border: 2px dashed #10b981; border-radius: 10px;"><h1 style="font-size: 60px;">🚌</h1><h3>VnBus Green AI</h3></div>""", unsafe_allow_html=True)
