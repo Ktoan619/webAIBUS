@@ -7,6 +7,7 @@ import io
 import requests
 import time
 from streamlit_js_eval import get_geolocation
+import hashlib # Thư viện để tạo mã kiểm tra file âm thanh
 
 # Import dữ liệu từ file data
 from data_and_prompts import BUS_DATA, get_full_system_instruction
@@ -64,16 +65,13 @@ def text_to_speech_stream(text):
         return audio_fp
     except: return None
 
-def transcribe_audio_with_gemini(audio_file, api_key):
+def transcribe_audio_with_gemini(audio_bytes, api_key):
     """Dùng Gemini để chuyển giọng nói thành văn bản"""
     if not api_key: return None
     try:
         genai.configure(api_key=api_key)
-        # SỬA LỖI: Chuyển sang model 2.0-flash-exp để đồng bộ và ổn định hơn
+        # Sử dụng model 2.0-flash-exp
         model = genai.GenerativeModel("gemini-2.0-flash-exp")
-        
-        # Đọc dữ liệu audio
-        audio_bytes = audio_file.read()
         
         prompt = "Hãy chép lại chính xác những gì người dùng nói trong đoạn ghi âm này bằng tiếng Việt. Chỉ trả về nội dung văn bản, không thêm lời dẫn."
         
@@ -143,6 +141,8 @@ if "messages" not in st.session_state:
 if "selected_route" not in st.session_state: st.session_state.selected_route = None
 if "custom_route" not in st.session_state: st.session_state.custom_route = None
 if "user_location" not in st.session_state: st.session_state.user_location = None
+# Thêm trạng thái lưu ID file âm thanh cuối cùng
+if "last_audio_hash" not in st.session_state: st.session_state.last_audio_hash = None
 
 # --- 4. GIAO DIỆN SIDEBAR ---
 with st.sidebar:
@@ -189,21 +189,33 @@ with col1:
         # 1. Nhập văn bản
         text_prompt = st.chat_input("Nhập nơi muốn đến...")
         
-        # 2. Nhập giọng nói (Widget mới)
+        # 2. Nhập giọng nói
         audio_prompt = st.audio_input("🎙️ Nhấn để nói", label_visibility="collapsed")
         
         final_prompt = None
         
-        # Ưu tiên xử lý Audio nếu có
+        # --- XỬ LÝ VOICE (SỬA LỖI LẶP) ---
         if audio_prompt:
             if not gemini_key:
                 st.error("Vui lòng nhập Gemini Key để dùng tính năng giọng nói.")
             else:
-                with st.spinner("Đang nghe và dịch..."):
-                    transcribed_text = transcribe_audio_with_gemini(audio_prompt, gemini_key)
-                    if transcribed_text:
-                        final_prompt = transcribed_text
-        # Nếu không có audio mới dùng text
+                # Đọc dữ liệu file âm thanh để tạo mã hash
+                audio_bytes = audio_prompt.getvalue()
+                audio_hash = hashlib.md5(audio_bytes).hexdigest()
+                
+                # Chỉ xử lý nếu mã hash khác mã cũ (tức là file âm thanh mới)
+                if audio_hash != st.session_state.last_audio_hash:
+                    st.session_state.last_audio_hash = audio_hash # Cập nhật hash mới
+                    
+                    with st.spinner("Đang nghe và dịch..."):
+                        transcribed_text = transcribe_audio_with_gemini(audio_bytes, gemini_key)
+                        if transcribed_text:
+                            final_prompt = transcribed_text
+                        else:
+                            st.warning("Không nghe rõ, vui lòng nói lại.")
+                # Nếu mã hash giống cũ -> Bỏ qua (đây là do rerun tạo ra)
+        
+        # Nếu không có audio mới, kiểm tra text input
         elif text_prompt:
             final_prompt = text_prompt
 
